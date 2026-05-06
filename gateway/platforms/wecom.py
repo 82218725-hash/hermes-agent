@@ -40,7 +40,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote, urlparse
 
 try:
@@ -200,6 +200,9 @@ class WeComAdapter(BasePlatformAdapter):
         # channel only supports one stream per request, so this mapping is
         # effectively reply_req_id -> stream_id.
         self._active_streams: Dict[str, Tuple[str, str]] = {}
+
+        # Tracks finalized streams so send_typing() doesn't reopen them.
+        self._finalized_streams: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -429,6 +432,17 @@ class WeComAdapter(BasePlatformAdapter):
         """Send a raw JSON frame over the active websocket."""
         if not self._ws or self._ws.closed:
             raise RuntimeError("WeCom websocket is not connected")
+        cmd = payload.get("cmd", "?")
+        body = payload.get("body", {})
+        msgtype = body.get("msgtype") if isinstance(body, dict) else "?"
+        stream_info = ""
+        if msgtype == "stream" and isinstance(body, dict):
+            s = body.get("stream", {})
+            stream_info = f" finish={s.get('finish')} id={s.get('id','?')[:12]}"
+        logger.info(
+            "[%s] WS >> cmd=%s msgtype=%s%s",
+            self.name, cmd, msgtype, stream_info,
+        )
         await self._ws.send_json(payload)
 
     async def _send_request(self, cmd: str, body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
@@ -896,13 +910,22 @@ class WeComAdapter(BasePlatformAdapter):
         Used as a fallback reply target when we need to send into a group
         without an explicit ``reply_to`` — WeCom AI Bots are blocked from
         APP_CMD_SEND in groups and must use APP_CMD_RESPONSE bound to some
-        prior req_id. Bounded like _reply_req_ids so long-running gateways
+        inbound req_id to reply passively.
+
+        The per-chat cache has a maximum size (DEDUP_MAX_SIZE) so we
         don't leak memory across many chats.
+
+        Also clears stale streaming state for this chat — when a new
+        inbound message arrives, any previous stream is done and the
+        next send_typing() / send() must open a fresh one.
         """
         normalized_chat_id = str(chat_id or "").strip()
         normalized_req_id = str(req_id or "").strip()
         if not normalized_chat_id or not normalized_req_id:
             return
+        # Clear streaming state for a fresh start on new messages
+        self._active_streams.pop(normalized_chat_id, None)
+        self._finalized_streams.discard(normalized_chat_id)
         self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
             self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
@@ -1252,6 +1275,10 @@ class WeComAdapter(BasePlatformAdapter):
         would stall the stream.
         """
         stream_id = stream_id or self._new_req_id("stream")
+        logger.info(
+            "[%s] _send_reply_stream: len=%d finish=%s stream_id=%s reply_req_id=%s",
+            self.name, len(content), finish, stream_id, reply_req_id,
+        )
         stream_payload = {
             "msgtype": "stream",
             "stream": {
@@ -1407,6 +1434,10 @@ class WeComAdapter(BasePlatformAdapter):
         ignore the ``streaming`` flag and always deliver as a single message.
         """
         streaming = bool(metadata.get("streaming")) if metadata else False
+        logger.info(
+            "[%s] send: chat_id=%s streaming=%s reply_to=%s content_len=%d",
+            self.name, chat_id, streaming, reply_to, len(content),
+        )
 
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
@@ -1418,9 +1449,25 @@ class WeComAdapter(BasePlatformAdapter):
             if not reply_req_id and chat_id in self._last_chat_req_ids:
                 reply_req_id = self._last_chat_req_ids[chat_id]
 
+            logger.info(
+                "[%s] send: reply_req_id=%s last_req_ids_keys=%s",
+                self.name, reply_req_id, list(self._last_chat_req_ids.keys()),
+            )
+
             if reply_req_id:
                 if streaming:
-                    stream_id = self._new_req_id("stream")
+                    existing = self._active_streams.get(chat_id)
+                    if existing:
+                        # Stream already opened by send_typing, continue it
+                        _, stream_id = existing
+                    else:
+                        # No typing bubble yet — open one now
+                        stream_id = self._new_req_id("stream")
+                        await self._send_reply_stream(
+                            reply_req_id, "",
+                            stream_id=stream_id, finish=False,
+                        )
+                        self._active_streams[chat_id] = (reply_req_id, stream_id)
                     response = await self._send_reply_stream(
                         reply_req_id,
                         content,
@@ -1451,7 +1498,7 @@ class WeComAdapter(BasePlatformAdapter):
         # In streaming reply-mode, reuse ``reply_req_id`` as the message_id so
         # ``edit_message`` / ``finalize_stream`` can look up the active stream.
         if streaming and stream_id and reply_req_id:
-            self._active_streams[reply_req_id] = (reply_req_id, stream_id)
+            self._active_streams[chat_id] = (reply_req_id, stream_id)
             message_id = reply_req_id
         else:
             message_id = self._payload_req_id(response) or uuid.uuid4().hex[:12]
@@ -1478,13 +1525,16 @@ class WeComAdapter(BasePlatformAdapter):
         ``edit_message`` to that protocol: each call delivers one more
         ``finish=False`` chunk under the existing ``stream_id``.
 
-        Returns ``SendResult(success=False, ...)`` if the message_id has no
+        Returns ``SendResult(success=False, ...)`` if the chat_id has no
         active stream (e.g. because the reply window has already been
         finalized, or the message was sent via the proactive path which
         does not support streaming).
         """
-        del chat_id
-        stream_info = self._active_streams.get(message_id)
+        stream_info = self._active_streams.get(chat_id)
+        logger.info(
+            "[%s] edit_message: message_id=%s stream_found=%s content_len=%d",
+            self.name, message_id, bool(stream_info), len(content),
+        )
         if not stream_info:
             return SendResult(success=False, error="no active stream for message")
 
@@ -1510,12 +1560,20 @@ class WeComAdapter(BasePlatformAdapter):
         of outcome to prevent leaks. Called by ``GatewayStreamConsumer`` at
         the end of a stream, on segment break, or on cancellation.
         """
-        del chat_id
-        stream_info = self._active_streams.pop(message_id, None)
+        stream_info = self._active_streams.pop(chat_id, None)
+        logger.info(
+            "[%s] finalize_stream: message_id=%s stream_found=%s content_len=%d",
+            self.name, message_id, bool(stream_info), len(content),
+        )
         if not stream_info:
             return SendResult(success=False, error="no active stream for message")
 
         reply_req_id, stream_id = stream_info
+        # Mark as finalized so send_typing() doesn't reopen this stream
+        # (e.g. from the progress-queue refresh loop).
+        self._finalized_streams.add(chat_id)
+        if len(self._finalized_streams) > 100:
+            self._finalized_streams.clear()
         # WeCom AI Bot errcode 6000 ("more than one callers at the same time")
         # fires when the finish=True frame arrives while the server is still
         # processing the previous fire-and-forget chunk. A short grace period
@@ -1622,17 +1680,44 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """WeCom does not expose typing indicators in this adapter.
+        """Open an empty native stream to trigger WeCom's thinking bubble.
 
-        The AI Bot reply-channel protocol can render a ``<think></think>``
-        animation as the first frame of a stream, but because the stream
-        bubble is pinned to its initial position in the chat timeline, a
-        subsequent real reply would appear ABOVE any tool-progress messages
-        delivered via the proactive send channel. That is worse UX than no
-        animation at all, so we leave this as a no-op and rely on the
-        streaming delta itself as the "is responding" signal.
+        WeCom has no generic typing indicator API, but its AI Bot protocol
+        shows a thinking bubble when a ``msgtype:"stream"`` response is
+        opened. We send an empty first chunk here so the user sees the
+        bubble immediately; the actual response content continues the same
+        stream via :meth:`send` / :meth:`edit_message`.
         """
-        del chat_id, metadata
+        reply_req_id = self._last_chat_req_ids.get(chat_id)
+        if not reply_req_id:
+            return  # No req_id available, can't open a stream
+
+        if chat_id in self._active_streams:
+            return  # Stream already open for this chat
+
+        if chat_id in self._finalized_streams:
+            # Stream was finalized for this chat; don't reopen it until
+            # a new inbound message clears the flag via _remember_chat_req_id.
+            # Progress queue keeps calling us ~every 0.3s — without this guard
+            # we'd open a never-finalized ghost bubble on every tick.
+            return
+
+        stream_id = self._new_req_id("stream")
+        try:
+            await self._send_reply_stream(
+                reply_req_id,
+                "",
+                stream_id=stream_id,
+                finish=False,
+            )
+            self._active_streams[chat_id] = (reply_req_id, stream_id)
+            logger.info(
+                "[%s] send_typing: opened stream reply_req_id=%s stream_id=%s",
+                self.name, reply_req_id, stream_id,
+            )
+        except Exception as exc:
+            logger.debug("[%s] send_typing: failed to open stream: %s", self.name, exc)
+            # Non-fatal — content will send normally when AI responds
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
