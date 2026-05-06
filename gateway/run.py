@@ -2722,6 +2722,88 @@ class GatewayRunner:
         task.add_done_callback(self._background_tasks.discard)
         return True
 
+    def _detect_stale_code(self) -> bool:
+        """Return True if source files on disk are newer than the running process.
+
+        A gateway that survives ``hermes update`` (manual SIGTERM never
+        escalated, systemd restart race, detached-process respawn failed,
+        etc.) keeps pre-update modules cached in ``sys.modules``.  Later
+        imports of names added post-update — e.g. ``cfg_get`` from PR
+        #17304 — raise ImportError against the stale module object (see
+        Issue #17648).  Detecting this at the source — "the code on disk
+        is newer than me" — lets us auto-restart instead of serving
+        broken responses until the user notices and runs
+        ``hermes gateway restart`` manually.
+
+        Returns False when the boot-time snapshot is unavailable or no
+        sentinel file is readable, to avoid false-positive restart loops
+        in unusual checkouts (sparse clones, read-only filesystems).
+        """
+        if not self._boot_wall_time or not self._boot_repo_mtime:
+            return False
+        try:
+            current = _compute_repo_mtime(self._repo_root_for_staleness)
+        except Exception:
+            return False
+        if current <= 0.0:
+            return False
+        # 2-second slack guards against filesystems with coarse mtime
+        # resolution (FAT32, some NFS mounts).  Real updates always move
+        # the newest-file mtime forward by minutes, so this doesn't hide
+        # genuine staleness.
+        return current > self._boot_repo_mtime + 2.0
+
+    def _has_active_native_streams(self) -> bool:
+        """Return True if any adapter currently has an active native stream.
+
+        Prevents stale-code restart from killing processes mid-stream,
+        which would leave ghost typing bubbles on platforms (WeCom, etc.)
+        that have no "close-all-streams" API.
+        """
+        try:
+            return any(
+                len(getattr(adapter, "_active_streams", {})) > 0
+                for adapter in self.adapters.values()
+            )
+        except Exception:
+            return False
+
+    def _iter_active_native_streams(self):
+        """Yield (platform_name, chat_id) for each active native stream.
+
+        Used for logging — not a hot path.
+        """
+        for platform, adapter in self.adapters.items():
+            streams = getattr(adapter, "_active_streams", {})
+            for chat_id in streams:
+                yield (platform.name if hasattr(platform, "name") else str(platform), chat_id)
+
+    def _trigger_stale_code_restart(self) -> None:
+        """Idempotently kick off a graceful restart after stale-code detection.
+
+        Runs at most once per process.  The restart request goes through
+        the normal drain path so in-flight agent turns finish before the
+        process exits; the service manager (systemd / launchd / detached
+        profile watcher) then respawns with fresh code.  On manual
+        ``hermes gateway run`` installs without a supervisor, the
+        process exits and the user must restart by hand — but they get a
+        user-visible message telling them so.
+        """
+        if self._stale_code_restart_triggered:
+            return
+        self._stale_code_restart_triggered = True
+        logger.warning(
+            "Stale-code self-check: source files newer than gateway boot "
+            "time (boot=%.0f, newest=%.0f) — requesting graceful restart. "
+            "See Issue #17648.",
+            self._boot_repo_mtime,
+            _compute_repo_mtime(self._repo_root_for_staleness),
+        )
+        try:
+            self.request_restart(detached=False, via_service=True)
+        except Exception as exc:
+            logger.error("Stale-code restart request failed: %s", exc)
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -4656,6 +4738,37 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+
+        # Stale-code self-check (Issue #17648).  A gateway that survives
+        # ``hermes update`` keeps old modules cached in sys.modules; the
+        # first inbound message is our earliest safe chance to detect
+        # this and restart gracefully before we dispatch to the agent
+        # and hit ImportError on freshly-added names (e.g. cfg_get).
+        # Idempotent — runs the real check at most once per message, and
+        # request_restart() no-ops after the first call.
+        try:
+            if self._detect_stale_code():
+                # Don't restart while adapters have active native streams —
+                # killing the process mid-stream leaves ghost typing bubbles
+                # on platforms like WeCom that have no "close-all-streams" API.
+                if self._has_active_native_streams():
+                    logger.info(
+                        "Stale-code detected but %d adapter(s) have active native "
+                        "streams — deferring restart until streams are done.",
+                        sum(1 for _ in self._iter_active_native_streams()),
+                    )
+                else:
+                    self._trigger_stale_code_restart()
+                    # Acknowledge to the user so they don't see a silent
+                    # drop; the gateway will be back up in a moment via the
+                    # service manager / profile-watcher respawn.
+                    return (
+                        "⟳ Gateway code was updated in the background — "
+                        "restarting this gateway so your next message runs "
+                        "on the new code. Please retry in a moment."
+                    )
+        except Exception as _stale_exc:
+            logger.debug("Stale-code self-check failed: %s", _stale_exc)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
