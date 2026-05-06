@@ -923,8 +923,6 @@ class WeComAdapter(BasePlatformAdapter):
         normalized_req_id = str(req_id or "").strip()
         if not normalized_chat_id or not normalized_req_id:
             return
-        # Clear streaming state for a fresh start on new messages
-        self._active_streams.pop(normalized_chat_id, None)
         self._finalized_streams.discard(normalized_chat_id)
         self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
@@ -1434,6 +1432,24 @@ class WeComAdapter(BasePlatformAdapter):
         ignore the ``streaming`` flag and always deliver as a single message.
         """
         streaming = bool(metadata.get("streaming")) if metadata else False
+        # Native-streaming adapters (``native_streaming_unified``) must always
+        # use the reply-channel stream when a reply context exists, even if
+        # the caller didn't explicitly set ``metadata.streaming``.  Otherwise
+        # the thinking bubble opened by send_typing() stays open forever:
+        #   send_typing() → opens stream (bubble)
+        #   send(streaming=False) → sends markdown, NOT through stream
+        #   → stream never gets content nor finalize → ghost bubble
+        if not streaming and getattr(self, "native_streaming_unified", False):
+            has_reply_context = bool(
+                self._reply_req_id_for_message(reply_to)
+                or self._last_chat_req_ids.get(chat_id)
+            )
+            if has_reply_context:
+                streaming = True
+                logger.debug(
+                    "[%s] send: auto-enabling streaming for native_streaming_unified adapter",
+                    self.name,
+                )
         logger.info(
             "[%s] send: chat_id=%s streaming=%s reply_to=%s content_len=%d",
             self.name, chat_id, streaming, reply_to, len(content),
