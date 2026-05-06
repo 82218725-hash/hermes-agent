@@ -92,6 +92,9 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
+STREAM_EXPIRED_ERRCODE = 846608
+_STREAM_EXPIRED_RETRY_GRACE = 1.0
+
 DEDUP_MAX_SIZE = 1000
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
@@ -154,6 +157,11 @@ class WeComAdapter(BasePlatformAdapter):
     # stream, because WeCom's reply channel only allows one stream per
     # reply_req_id (reopening triggers errcode 6000 "data version conflict").
     native_streaming_unified = True
+    # Must finalize every stream with finish=True, even when the stream
+    # consumer's mid-stream edit already delivered the content.
+    # Without this, the WeCom server keeps the stream open permanently
+    # and send_typing() can't open new bubbles for subsequent replies.
+    REQUIRES_EDIT_FINALIZE = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WECOM)
@@ -187,8 +195,10 @@ class WeComAdapter(BasePlatformAdapter):
         # WeCom clients split long messages around 4000 chars.
         self._text_batch_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
         self._text_batch_split_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
+        self._text_batch_max_wait_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_MAX_WAIT_SECONDS", "5.0"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_text_batch_start: Dict[str, float] = {}  # monotonic timestamps
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
 
@@ -203,6 +213,22 @@ class WeComAdapter(BasePlatformAdapter):
 
         # Tracks finalized streams so send_typing() doesn't reopen them.
         self._finalized_streams: Set[str] = set()
+
+        # Track chats whose last inbound req_id came from an event callback.
+        # Event callbacks cannot use reply-mode streams (no thinking bubble),
+        # and their req_ids may not support reply stream at all — must use
+        # proactive send (APP_CMD_SEND) for the final frame, skip mid-stream.
+        self._event_callback_chats: Set[str] = set()
+
+        # Stream-level ack tracking for non-blocking send.
+        # Key: reply_req_id, Value: asyncio.Event that is set when the
+        # finish=True response is received or the entry is cleaned up.
+        self._stream_ack_events: Dict[str, asyncio.Event] = {}
+
+        # Heartbeat health tracking (Issue 6): count consecutive pings with
+        # no pong response. Reset on any successful ws message receive.
+        self._missed_pongs: int = 0
+        self._MAX_MISSED_PONGS: int = 3
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -378,12 +404,23 @@ class WeComAdapter(BasePlatformAdapter):
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if payload:
+                    # Any incoming message from the server resets the
+                    # heartbeat health counter (server is alive).
+                    self._missed_pongs = 0
                     await self._dispatch_payload(payload)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 raise RuntimeError("WeCom websocket closed")
 
     async def _heartbeat_loop(self) -> None:
-        """Send lightweight application-level pings."""
+        """Send lightweight application-level pings with timeout detection.
+
+        Increments ``_missed_pongs`` on each ping.  If it reaches
+        ``_MAX_MISSED_PONGS`` (i.e. 3 consecutive pings with no incoming
+        message from the server), raises a ``RuntimeError`` to trigger
+        reconnection via ``_listen_loop``'s error handler.
+
+        ``_read_events`` resets ``_missed_pongs = 0`` on every server frame.
+        """
         try:
             while self._running:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -399,6 +436,16 @@ class WeComAdapter(BasePlatformAdapter):
                     )
                 except Exception as exc:
                     logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
+
+                self._missed_pongs += 1
+                if self._missed_pongs >= self._MAX_MISSED_PONGS:
+                    logger.warning(
+                        "[%s] Heartbeat timeout: %d consecutive pings without response — forcing reconnect",
+                        self.name, self._missed_pongs,
+                    )
+                    raise RuntimeError(
+                        f"Heartbeat timeout after {self._missed_pongs} missed pongs"
+                    )
         except asyncio.CancelledError:
             pass
 
@@ -416,7 +463,18 @@ class WeComAdapter(BasePlatformAdapter):
         if cmd in CALLBACK_COMMANDS:
             await self._on_message(payload)
             return
-        if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+        if cmd == APP_CMD_PING:
+            return
+        if cmd == APP_CMD_EVENT_CALLBACK:
+            # Event callbacks carry a chat context but cannot use reply-mode
+            # streams — store the req_id as event-callback-originated so
+            # send() can choose proactive mode instead.
+            chat_id = self._extract_chat_id_from_event_callback(payload)
+            if chat_id:
+                evt_req_id = self._payload_req_id(payload)
+                if evt_req_id:
+                    self._remember_chat_req_id(chat_id, evt_req_id)
+                    self._event_callback_chats.add(chat_id)
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -505,6 +563,17 @@ class WeComAdapter(BasePlatformAdapter):
             logger.debug("Failed to parse WeCom payload: %r", raw)
             return None
         return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _extract_chat_id_from_event_callback(payload: Dict[str, Any]) -> Optional[str]:
+        """Extract chat_id from an event callback payload."""
+        body = payload.get("body")
+        if not isinstance(body, dict):
+            return None
+        sender = body.get("from") if isinstance(body.get("from"), dict) else {}
+        sender_id = str(sender.get("userid") or "").strip()
+        chat_id = str(body.get("chatid") or sender_id).strip()
+        return chat_id or None
 
     # ------------------------------------------------------------------
     # Inbound message parsing
@@ -606,14 +675,44 @@ class WeComAdapter(BasePlatformAdapter):
         When WeCom splits a long user message at 4000 chars, the chunks
         arrive within a few hundred milliseconds.  This merges them into
         a single event before dispatching.
+
+        Enforces ``_text_batch_max_wait_seconds`` (default 5.0): if the
+        first event in a batch has been waiting longer than the max, the
+        batch is flushed immediately instead of resetting the timer.
         """
+        import time as _time
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        now = _time.monotonic()
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
+            self._pending_text_batch_start[key] = now
         else:
+            # Check if the batch has been waiting too long — flush immediately.
+            start_ts = self._pending_text_batch_start.get(key, now)
+            if now - start_ts >= self._text_batch_max_wait_seconds:
+                logger.info(
+                    "[WeCom] Forcing text batch flush for %s after %.1fs (max=%ds)",
+                    key, now - start_ts, self._text_batch_max_wait_seconds,
+                )
+                # Merge and dispatch now
+                if event.text:
+                    existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+                if event.media_urls:
+                    existing.media_urls.extend(event.media_urls)
+                    existing.media_types.extend(event.media_types)
+                prior_task = self._pending_text_batch_tasks.get(key)
+                if prior_task and not prior_task.done():
+                    prior_task.cancel()
+                self._pending_text_batch_tasks.pop(key, None)
+                self._pending_text_batch_start.pop(key, None)
+                dispatched_event = self._pending_text_batches.pop(key, None)
+                if dispatched_event:
+                    asyncio.create_task(self.handle_message(dispatched_event))
+                return
+
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
@@ -839,6 +938,20 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _guess_filename(url: str, content_disposition: Optional[str], content_type: str) -> str:
         if content_disposition:
+            # RFC 5987: filename*=UTF-8''encoded-filename.ext
+            rfc5987_match = re.search(
+                r"filename\*\s*=\s*(?:UTF-8|utf-8)''([^;\s]+)",
+                content_disposition,
+                re.IGNORECASE,
+            )
+            if rfc5987_match:
+                try:
+                    from urllib.parse import unquote
+                    return unquote(rfc5987_match.group(1))
+                except Exception:
+                    return rfc5987_match.group(1)
+
+            # Fallback: bare filename="..."
             match = re.search(r'filename="?([^";]+)"?', content_disposition)
             if match:
                 return match.group(1)
@@ -923,6 +1036,11 @@ class WeComAdapter(BasePlatformAdapter):
         normalized_req_id = str(req_id or "").strip()
         if not normalized_chat_id or not normalized_req_id:
             return
+        # Clear any stale active stream entry for this chat so the next
+        # send_typing() / send() can open a fresh one.  In normal flow
+        # finalize_stream() already pops the entry; this is a safety net
+        # for edge cases (interrupted turns, gateway restarts).
+        self._active_streams.pop(normalized_chat_id, None)
         self._finalized_streams.discard(normalized_chat_id)
         self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
@@ -1271,6 +1389,10 @@ class WeComAdapter(BasePlatformAdapter):
         chunks (``finish=False``) are fire-and-forget via :meth:`_send_json`
         — WeCom AI Bot does not send per-chunk ACKs, and waiting for one
         would stall the stream.
+
+        When the WeCom server returns errcode 846608 (stream expired, usually
+        after ~6 minutes of inactivity), falls back to sending the content as
+        a final markdown reply via :meth:`_send_reply_markdown`.
         """
         stream_id = stream_id or self._new_req_id("stream")
         logger.info(
@@ -1287,6 +1409,16 @@ class WeComAdapter(BasePlatformAdapter):
         }
         if finish:
             response = await self._send_reply_request(reply_req_id, stream_payload)
+            errcode = response.get("errcode", 0)
+            if errcode == STREAM_EXPIRED_ERRCODE:
+                logger.warning(
+                    "[%s] Stream expired (errcode=%d) for reply_req_id=%s, "
+                    "falling back to markdown reply",
+                    self.name, STREAM_EXPIRED_ERRCODE, reply_req_id,
+                )
+                await asyncio.sleep(_STREAM_EXPIRED_RETRY_GRACE)
+                response = await self._send_reply_markdown(reply_req_id, content)
+                return response
             self._raise_for_wecom_error(response, "send reply stream")
             return response
 
@@ -1298,6 +1430,43 @@ class WeComAdapter(BasePlatformAdapter):
             }
         )
         return {"headers": {"req_id": reply_req_id}}
+
+    async def _send_reply_stream_non_blocking(
+        self,
+        reply_req_id: str,
+        content: str,
+        stream_id: Optional[str] = None,
+        finish: bool = True,
+    ) -> Dict[str, Any]:
+        """Non-blocking variant of :meth:`_send_reply_stream`.
+
+        If the previous non-final frame for this ``reply_req_id`` stream has
+        not yet been acknowledged (i.e. no finish=True has been sent yet and
+        a send is already in-flight), intermediate frames return a dict with
+        key ``"skipped"`` set to ``True`` so the caller can avoid blocking.
+
+        Final frames (``finish=True``) are never skipped — they always send,
+        because otherwise the stream would hang open forever.
+        """
+        if not finish:
+            # Check if there is already an in-flight stream chunk pending
+            # for this reply_req_id by looking for a pending future.
+            pending_future = self._pending_responses.get(reply_req_id)
+            if pending_future and not pending_future.done():
+                logger.info(
+                    "[%s] _send_reply_stream_non_blocking: "
+                    "SKIPPED non-final frame for reply_req_id=%s "
+                    "(previous frame not yet acked)",
+                    self.name, reply_req_id,
+                )
+                return {"skipped": True, "headers": {"req_id": reply_req_id}}
+
+        return await self._send_reply_stream(
+            reply_req_id=reply_req_id,
+            content=content,
+            stream_id=stream_id,
+            finish=finish,
+        )
 
     async def _send_reply_media_message(
         self,
@@ -1463,7 +1632,20 @@ class WeComAdapter(BasePlatformAdapter):
             reply_req_id = self._reply_req_id_for_message(reply_to)
 
             if not reply_req_id and chat_id in self._last_chat_req_ids:
-                reply_req_id = self._last_chat_req_ids[chat_id]
+                # Only reuse the cached inbound req_id as reply context if:
+                # 1. There's an active stream (within-stream continuation), OR
+                # 2. No stream has been finalized yet (first independent reply).
+                # Using the cached req_id after a previous stream was finalized
+                # would cause the new message to overwrite the previous one on
+                # WeCom's reply channel (same reply_req_id = same message target).
+                if chat_id in self._active_streams or chat_id not in self._finalized_streams:
+                    reply_req_id = self._last_chat_req_ids[chat_id]
+                else:
+                    logger.info(
+                        "[%s] send: skipping _last_chat_req_ids fallback for %s "
+                        "(stream already finalized, would overwrite previous message)",
+                        self.name, chat_id,
+                    )
 
             logger.info(
                 "[%s] send: reply_req_id=%s last_req_ids_keys=%s",
@@ -1472,6 +1654,18 @@ class WeComAdapter(BasePlatformAdapter):
 
             if reply_req_id:
                 if streaming:
+                    # Event callback messages cannot use reply-mode streams.
+                    # Skip non-final frames entirely; finalize_stream()
+                    # handles the final flush via proactive send.
+                    if chat_id in self._event_callback_chats:
+                        logger.info(
+                            "[%s] send: skipping streaming chunk for event_callback chat %s",
+                            self.name, chat_id,
+                        )
+                        return SendResult(
+                            success=True,
+                            message_id=reply_req_id or uuid.uuid4().hex[:12],
+                        )
                     existing = self._active_streams.get(chat_id)
                     if existing:
                         # Stream already opened by send_typing, continue it
@@ -1479,12 +1673,12 @@ class WeComAdapter(BasePlatformAdapter):
                     else:
                         # No typing bubble yet — open one now
                         stream_id = self._new_req_id("stream")
-                        await self._send_reply_stream(
+                        await self._send_reply_stream_non_blocking(
                             reply_req_id, "",
                             stream_id=stream_id, finish=False,
                         )
                         self._active_streams[chat_id] = (reply_req_id, stream_id)
-                    response = await self._send_reply_stream(
+                    response = await self._send_reply_stream_non_blocking(
                         reply_req_id,
                         content,
                         stream_id=stream_id,
@@ -1575,7 +1769,36 @@ class WeComAdapter(BasePlatformAdapter):
         The stream entry is removed from ``self._active_streams`` regardless
         of outcome to prevent leaks. Called by ``GatewayStreamConsumer`` at
         the end of a stream, on segment break, or on cancellation.
+
+        For event callback chats (where streaming was skipped), sends the
+        content as a proactive markdown message via APP_CMD_SEND.
         """
+        # Event callback: no stream was opened; send proactively instead.
+        if chat_id in self._event_callback_chats:
+            self._event_callback_chats.discard(chat_id)
+            logger.info(
+                "[%s] finalize_stream: event_callback chat %s — sending proactively",
+                self.name, chat_id,
+            )
+            try:
+                response = await self._send_request(
+                    APP_CMD_SEND,
+                    {
+                        "chatid": chat_id,
+                        "msgtype": "markdown",
+                        "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                    },
+                )
+                self._raise_for_wecom_error(response, "finalize_stream proactive send")
+                return SendResult(
+                    success=True,
+                    message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
+                    raw_response=response,
+                )
+            except Exception as exc:
+                logger.error("[%s] finalize_stream proactive send failed: %s", self.name, exc)
+                return SendResult(success=False, error=str(exc))
+
         stream_info = self._active_streams.pop(chat_id, None)
         logger.info(
             "[%s] finalize_stream: message_id=%s stream_found=%s content_len=%d",
@@ -1588,6 +1811,12 @@ class WeComAdapter(BasePlatformAdapter):
         # Mark as finalized so send_typing() doesn't reopen this stream
         # (e.g. from the progress-queue refresh loop).
         self._finalized_streams.add(chat_id)
+        # Clear the cached inbound req_id so subsequent independent sends
+        # to this chat create fresh messages via proactive APP_CMD_SEND
+        # instead of reusing this stream's reply channel (which would
+        # overwrite the finalized message on WeCom).  The next inbound
+        # user message will repopulate _last_chat_req_ids automatically.
+        self._last_chat_req_ids.pop(chat_id, None)
         if len(self._finalized_streams) > 100:
             self._finalized_streams.clear()
         # WeCom AI Bot errcode 6000 ("more than one callers at the same time")
@@ -1601,9 +1830,16 @@ class WeComAdapter(BasePlatformAdapter):
             response = await self._send_reply_stream(
                 reply_req_id, content, stream_id=stream_id, finish=True,
             )
+            # Notify any waiters on the ack event for this reply_req_id.
+            ack_event = self._stream_ack_events.get(reply_req_id)
+            if ack_event:
+                ack_event.set()
             return SendResult(success=True, message_id=message_id, raw_response=response)
         except Exception as exc:
             logger.error("[%s] Stream finalize failed: %s", self.name, exc)
+            ack_event = self._stream_ack_events.get(reply_req_id)
+            if ack_event:
+                ack_event.set()
             return SendResult(success=False, error=str(exc))
 
     async def send_image(

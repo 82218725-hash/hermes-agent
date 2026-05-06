@@ -1004,6 +1004,8 @@ class GatewayRunner:
     _restart_task_started: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
+    _deferred_restart_requested: bool = False
+    _deferred_restart_params: Dict[str, Any] = {}
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
@@ -2708,6 +2710,26 @@ class GatewayRunner:
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
+
+        # Don't kill the process mid-stream — leaving ghost typing bubbles on
+        # platforms like WeCom that have no "close-all-streams" API.
+        if self._has_active_native_streams():
+            if self._deferred_restart_requested:
+                return False  # already deferred
+            self._deferred_restart_requested = True
+            self._deferred_restart_params = dict(detached=detached, via_service=via_service)
+            stream_list = list(self._iter_active_native_streams())
+            logger.warning(
+                "Restart deferred — %d native stream(s) still active: %s. "
+                "Will restart once streams are finalized.",
+                len(stream_list),
+                stream_list,
+            )
+            asyncio.create_task(self._wait_for_streams_then_restart(
+                drain_timeout=self._restart_drain_timeout,
+            ))
+            return False
+
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
@@ -2721,6 +2743,43 @@ class GatewayRunner:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return True
+
+    async def _wait_for_streams_then_restart(self, *, drain_timeout: float = 30.0) -> None:
+        """Poll until all active native streams are gone, then restart.
+
+        Runs when a restart was deferred because adapters had active native
+        streams (ghost-typing-bubble prevention).  Polls every 0.5s up to
+        *drain_timeout* seconds, then forces the restart regardless.
+        """
+        deadline = time.monotonic() + drain_timeout
+        while time.monotonic() < deadline:
+            if not self._has_active_native_streams():
+                logger.info(
+                    "All native streams finalized — proceeding with deferred restart."
+                )
+                break
+            await asyncio.sleep(0.5)
+        else:
+            remaining = list(self._iter_active_native_streams())
+            logger.warning(
+                "Deferred restart timeout after %.0fs — forcing restart with %d "
+                "orphaned native stream(s): %s",
+                drain_timeout,
+                len(remaining),
+                remaining,
+            )
+
+        self._deferred_restart_requested = False
+        self._restart_requested = True
+        self._restart_detached = self._deferred_restart_params.get("detached", False)
+        self._restart_via_service = self._deferred_restart_params.get("via_service", True)
+        self._restart_task_started = True
+
+        await self.stop(
+            restart=True,
+            detached_restart=self._restart_detached,
+            service_restart=self._restart_via_service,
+        )
 
     def _detect_stale_code(self) -> bool:
         """Return True if source files on disk are newer than the running process.
@@ -4040,6 +4099,27 @@ class GatewayRunner:
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
+
+            # On restart, disconnect adapters BEFORE draining so the new
+            # process can subscribe to WeCom (and other WS-based platforms)
+            # without conflicting with the old process's still-open socket.
+            # Agents' still-cooking responses are lost, but session state is
+            # saved and auto-resumed by the new gateway process.
+            # Then exit immediately — no drain wait, no retries to a dead WS.
+            if self._restart_requested:
+                for _p, _adapter in list(self.adapters.items()):
+                    try:
+                        await _adapter.disconnect()
+                        logger.info("✓ %s disconnected (early restart)", _p.value)
+                    except Exception:
+                        pass
+                self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
+                self._exit_reason = "Gateway restart requested (early)"
+                self._draining = False
+                self._update_runtime_status("stopped", self._exit_reason)
+                logger.info("Gateway stopped (early restart)")
+                self._shutdown_event.set()
+                return
 
             timeout = self._restart_drain_timeout
             active_agents, timed_out = await self._drain_active_agents(timeout)
@@ -14930,7 +15010,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             )
             _hermes_procs = [
                 line for line in _ps.stdout.splitlines()
-                if ("hermes" in line.lower() or "gateway" in line.lower())
+                if any(name in line for name in ("hermes_cli", "hermes-agent"))
                 and str(os.getpid()) not in line.split()[1:2]  # exclude self
             ]
             if _hermes_procs:
