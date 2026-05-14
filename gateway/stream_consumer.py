@@ -453,10 +453,24 @@ class GatewayStreamConsumer:
                     return
 
                 if commentary_text is not None:
+                    # For unified native streaming adapters (e.g. WeCom),
+                    # preserve _message_id across commentary so that
+                    # finalize_stream can be called when got_done fires.
+                    # _reset_segment_state() would clear it, causing the
+                    # native stream to be left open on the server forever
+                    # (the "两条在跑" / ghost-stream bug).
+                    _native_commentary_preserve_id = (
+                        self._message_id
+                        if getattr(self.adapter, "native_streaming_unified", False) is True
+                        else None
+                    )
                     self._reset_segment_state()
                     await self._send_commentary(commentary_text)
                     self._last_edit_time = time.monotonic()
-                    self._reset_segment_state()
+                    if _native_commentary_preserve_id is not None:
+                        self._message_id = _native_commentary_preserve_id
+                    else:
+                        self._reset_segment_state()
 
                 # Tool boundary: reset message state so the next text chunk
                 # creates a fresh message below any tool-progress messages.
@@ -893,14 +907,30 @@ class GatewayStreamConsumer:
         succeeded. Returns False for adapters without native streaming, for
         the ``__no_edit__`` sentinel, or when the adapter reports failure —
         callers fall back to the generic send/edit path in that case.
+
+        For ``native_streaming_unified`` adapters (e.g. WeCom), the
+        ``_message_id`` may have been cleared by ``_reset_segment_state()``
+        (triggered by commentary/tool-progress sends).  In that case we fall
+        back to ``chat_id`` as the message_id — the adapter's
+        ``finalize_stream`` typically looks up the active stream by chat_id
+        rather than message_id, so this still works.
         """
         if not hasattr(self.adapter, "finalize_stream"):
             return False
-        if self._message_id in (None, "__no_edit__"):
+        if self._message_id == "__no_edit__":
             return False
+        if self._message_id is None:
+            # When _message_id is None (cleared by commentary path), only
+            # native_streaming_unified adapters can still finalize because
+            # they look up by chat_id.  All other adapters skip.
+            if not getattr(self.adapter, "native_streaming_unified", False):
+                return False
+            fallback_id = self.chat_id
+        else:
+            fallback_id = self._message_id
         try:
             result = await self.adapter.finalize_stream(
-                self.chat_id, self._message_id, text,
+                self.chat_id, fallback_id, text,
             )
         except Exception as exc:
             logger.debug("finalize_stream raised: %s", exc)

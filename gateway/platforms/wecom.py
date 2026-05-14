@@ -97,6 +97,20 @@ _STREAM_EXPIRED_RETRY_GRACE = 1.0
 
 DEDUP_MAX_SIZE = 1000
 
+# 模板卡片类型
+VALID_CARD_TYPES = frozenset({
+    "text_notice",
+    "news_notice",
+    "button_interaction",
+    "vote_interaction",
+    "multiple_interaction",
+})
+
+# 正则：匹配 markdown JSON 代码块，用于提取模板卡片
+_TEMPLATE_CARD_BLOCK_RE = re.compile(r"```(?:json)?\s*\n([\s\S]*?)\n```", re.MULTILINE)
+# 正则：匹配未闭合的代码块尾部（LLM 正在输出中的模板卡片）
+_TEMPLATE_CARD_UNCLOSED_RE = re.compile(r"```(?:json)?\s*\n[\s\S]*$", re.MULTILINE)
+
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_MAX_BYTES = 10 * 1024 * 1024
 VOICE_MAX_BYTES = 2 * 1024 * 1024
@@ -110,6 +124,12 @@ VOICE_SUPPORTED_MIMES = {"audio/amr"}
 def check_wecom_requirements() -> bool:
     """Check if WeCom runtime dependencies are available."""
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
+
+
+def _urlesc(value: str) -> str:
+    """URL-encode a string using quote from urllib.parse."""
+    from urllib.parse import quote as _quote
+    return _quote(str(value), safe="")
 
 
 def _coerce_list(value: Any) -> List[str]:
@@ -181,6 +201,27 @@ class WeComAdapter(BasePlatformAdapter):
         self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "open")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
+
+        # Agent HTTP API 回退配置
+        raw_agent = extra.get("agent")
+        self._agent_corp_id: str = ""
+        self._agent_corp_secret: str = ""
+        self._agent_id: int = 0
+        self._agent_configured: bool = False
+        if isinstance(raw_agent, dict):
+            self._agent_corp_id = str(raw_agent.get("corp_id") or raw_agent.get("corpId") or "").strip()
+            self._agent_corp_secret = str(raw_agent.get("corp_secret") or raw_agent.get("corpSecret") or "").strip()
+            raw_agent_id = raw_agent.get("agent_id") or raw_agent.get("agentId") or 0
+            try:
+                self._agent_id = int(raw_agent_id)
+            except (TypeError, ValueError):
+                self._agent_id = 0
+            self._agent_configured = bool(self._agent_corp_id and self._agent_corp_secret and self._agent_id > 0)
+
+        # Agent API token 缓存
+        self._agent_token: str = ""
+        self._agent_token_expires_at: float = 0.0
+        self._agent_token_refresh_lock: asyncio.Lock = asyncio.Lock()
 
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
@@ -475,6 +516,13 @@ class WeComAdapter(BasePlatformAdapter):
                 if evt_req_id:
                     self._remember_chat_req_id(chat_id, evt_req_id)
                     self._event_callback_chats.add(chat_id)
+            # 检查是否包含模板卡片事件回调（按钮点击、提交等）—
+            # 需要路由给 _on_message 处理
+            body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+            if str(body.get("msgtype") or "").lower() == "event":
+                event_body = body.get("event") if isinstance(body.get("event"), dict) else {}
+                if str(event_body.get("eventtype") or "").strip() == "template_card_event":
+                    await self._on_message(payload)
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -759,6 +807,15 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _extract_text(body: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         """Extract plain text and quoted text from a callback payload."""
+        # 处理模板卡片事件回调（用户点击按钮、提交表单等）
+        msgtype = str(body.get("msgtype") or "").lower()
+        if msgtype == "event":
+            event_body = body.get("event") if isinstance(body.get("event"), dict) else {}
+            event_type = str(event_body.get("eventtype") or "").strip()
+            if event_type == "template_card_event":
+                card_event = event_body.get("template_card_event") if isinstance(event_body.get("template_card_event"), dict) else {}
+                return WeComAdapter._format_template_card_event_text(body, card_event), None
+
         text_parts: List[str] = []
         reply_text: Optional[str] = None
         msgtype = str(body.get("msgtype") or "").lower()
@@ -1364,6 +1421,637 @@ class WeComAdapter(BasePlatformAdapter):
         self._raise_for_wecom_error(response, "send media message")
         return response
 
+    # ------------------------------------------------------------------
+    # 模板卡片（template_card）支持
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_template_cards(text: str) -> Optional[Tuple[List[Dict[str, Any]], str]]:
+        """从 LLM 回复文本中提取模板卡片 JSON 代码块。
+
+        匹配规则：
+        1. 扫描所有 ```json ... ``` 或 ``` ... ``` 代码块
+        2. 尝试 JSON.parse，检查是否包含合法的 card_type
+        3. 合法卡片从原文移除并返回；不合法保留原文
+
+        Returns:
+            (cards, remaining_text) — 卡片列表和去除卡片代码块后的剩余文本。
+            若未找到任何卡片则返回 None。
+        """
+        if not text or not text.strip():
+            return None
+
+        cards: List[Dict[str, Any]] = []
+        blocks_to_remove: List[str] = []
+
+        for match in _TEMPLATE_CARD_BLOCK_RE.finditer(text):
+            full_match = match.group(0)
+            json_content = match.group(1).strip()
+            if not json_content:
+                continue
+
+            try:
+                parsed = json.loads(json_content)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+
+            if not isinstance(parsed, dict):
+                continue
+
+            card_type = parsed.get("card_type")
+            if not isinstance(card_type, str) or card_type not in VALID_CARD_TYPES:
+                continue
+
+            # 确保主要字段存在
+            if "template_card" not in parsed:
+                # 兼容两种格式：直接 card_type 在外层或 template_card 嵌套
+                parsed = {"template_card": parsed}
+
+            cards.append(parsed)
+            blocks_to_remove.append(full_match)
+
+        if not cards:
+            return None
+
+        # 从原文中移除已提取的代码块
+        remaining_text = text
+        for block in blocks_to_remove:
+            remaining_text = remaining_text.replace(block, "", 1)
+
+        # 清理多余空行
+        remaining_text = re.sub(r"\n{3,}", "\n\n", remaining_text).strip()
+
+        logger.info(
+            "[WeCom] Extracted %d template card(s) from response "
+            "(original=%d chars, remaining=%d chars)",
+            len(cards), len(text), len(remaining_text),
+        )
+        return cards, remaining_text
+
+    async def _send_template_card_message(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+        reply_req_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """通过 WebSocket 发送一条模板卡片消息。
+
+        优先使用 reply channel（有 reply_req_id），否则用 proactive send。
+        """
+        template_card_body = card.get("template_card", card)
+        body = {
+            "msgtype": "template_card",
+            "template_card": template_card_body,
+        }
+
+        try:
+            if reply_req_id:
+                response = await self._send_reply_request(
+                    reply_req_id,
+                    body,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            else:
+                response = await self._send_request(
+                    APP_CMD_SEND,
+                    {"chatid": chat_id, **body},
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            errcode = response.get("errcode", 0)
+            if errcode not in (0, None):
+                logger.warning(
+                    "[%s] Template card send failed (errcode=%s): %s",
+                    self.name, errcode, response.get("errmsg", ""),
+                )
+                return None
+            logger.info("[%s] Template card sent: card_type=%s", self.name, template_card_body.get("card_type"))
+            return response
+        except Exception as exc:
+            logger.warning("[%s] Template card send error: %s", self.name, exc)
+            return None
+
+    async def _detect_and_send_template_cards(
+        self,
+        content: str,
+        chat_id: str,
+        reply_req_id: Optional[str] = None,
+    ) -> str:
+        """从内容中检测模板卡片 JSON 代码块，发送后返回剩余文本。
+
+        如果未检测到卡片，原样返回 content。
+        """
+        result = self._extract_template_cards(content)
+        if result is None:
+            return content
+
+        cards, remaining_text = result
+        for card in cards:
+            await self._send_template_card_message(
+                chat_id, card, reply_req_id=reply_req_id,
+            )
+
+        return remaining_text
+
+    @staticmethod
+    def mask_template_card_blocks(text: str) -> str:
+        """遮罩流式中间帧中的模板卡片 JSON 代码块。
+
+        已闭合的代码块（含 card_type）→ "📋 *正在生成卡片消息...*"
+        未闭合的代码块尾部 → 截断
+        非模板卡片代码块 → 保留
+        """
+        if not text:
+            return text
+
+        masked = text
+
+        # 处理已闭合的代码块
+        masked = _TEMPLATE_CARD_BLOCK_RE.sub(
+            lambda m: "\n\n📋 *正在生成卡片消息...*\n\n"
+            if '"card_type"' in m.group(1) or "'card_type'" in m.group(1)
+            else m.group(0),
+            masked,
+        )
+
+        # 处理未闭合的代码块尾部
+        unclosed_match = _TEMPLATE_CARD_UNCLOSED_RE.search(masked)
+        if unclosed_match:
+            unclosed_content = unclosed_match.group(0)
+            if '"card_type"' in unclosed_content or "'card_type'" in unclosed_content:
+                masked = masked[:unclosed_match.start()] + "\n\n📋 *正在生成卡片消息...*"
+
+        return masked
+
+    @staticmethod
+    def _format_template_card_event_text(body: Dict[str, Any], card_event: Dict[str, Any]) -> str:
+        """将模板卡片事件回调格式化为可继续路由给大模型的文本。"""
+        if not isinstance(card_event, dict):
+            return ""
+        selected_items = card_event.get("selected_items") if isinstance(card_event.get("selected_items"), dict) else {}
+        raw_selected = selected_items.get("selected_item") if isinstance(selected_items.get("selected_item"), list) else []
+        selected_lines = []
+        for item in raw_selected:
+            if not isinstance(item, dict):
+                continue
+            qk = str(item.get("question_key") or "").strip() or "unknown_question"
+            raw_ids = item.get("option_ids") if isinstance(item.get("option_ids"), dict) else {}
+            ids = raw_ids.get("option_id") if isinstance(raw_ids.get("option_id"), list) else []
+            selected_lines.append(
+                f"- {qk}: {', '.join(str(i) for i in ids if i) if ids else '(未选择)'}"
+            )
+
+        sender = body.get("from") if isinstance(body.get("from"), dict) else {}
+        sender_userid = str(sender.get("userid") or "")
+        sender_corpid = str(sender.get("corpid") or "")
+        chatid = str(body.get("chatid") or sender_userid)
+
+        lines = [
+            "[企业微信模板卡片回调]",
+            f"event_type(事件类型): template_card_event",
+            f"msgid(消息 id): {body.get('msgid')}" if body.get("msgid") else None,
+            f"chat_type(会话类型): {body.get('chattype')}" if body.get("chattype") else None,
+            f"chat_id(会话 id): {chatid}" if chatid else None,
+            f"from.corpid(企业 id): {sender_corpid}" if sender_corpid else None,
+            f"from.userid(发送人 id): {sender_userid}" if sender_userid else None,
+            f"card_type(卡片类型): {card_event.get('card_type')}" if card_event.get("card_type") else None,
+            f"event_key(事件 key): {card_event.get('event_key')}" if card_event.get("event_key") else None,
+            f"task_id(任务 id): {card_event.get('task_id')}" if card_event.get("task_id") else None,
+            "selected_items(选择项):" if selected_lines else "selected_items(选择项): []",
+            *selected_lines,
+        ]
+        return "\n".join(line for line in lines if line is not None)
+
+    # ------------------------------------------------------------------
+    # Agent HTTP API — 双通道回退
+    # ------------------------------------------------------------------
+
+    _API_GET_TOKEN = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
+    _API_SEND_MESSAGE = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+    _API_SEND_APPCHAT = "https://qyapi.weixin.qq.com/cgi-bin/appchat/send"
+    _API_UPLOAD_MEDIA = "https://qyapi.weixin.qq.com/cgi-bin/media/upload"
+
+    async def _get_agent_token(self) -> str:
+        """获取 Agent API AccessToken，带缓存和自动刷新。"""
+        now = asyncio.get_running_loop().time()
+        if self._agent_token and self._agent_token_expires_at > now + 60:
+            return self._agent_token
+
+        async with self._agent_token_refresh_lock:
+            # 双重检查
+            if self._agent_token and self._agent_token_expires_at > now + 60:
+                return self._agent_token
+
+            url = (
+                f"{self._API_GET_TOKEN}?corpid={_urlesc(self._agent_corp_id)}"
+                f"&corpsecret={_urlesc(self._agent_corp_secret)}"
+            )
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url)
+                data = resp.json()
+
+            errcode = data.get("errcode", -1)
+            if errcode != 0 or not data.get("access_token"):
+                raise RuntimeError(
+                    f"Agent gettoken failed: errcode={errcode} errmsg={data.get('errmsg', '?')}"
+                )
+            self._agent_token = data["access_token"]
+            expires_in = data.get("expires_in", 7200)
+            self._agent_token_expires_at = now + expires_in
+            logger.info("[%s] Agent token refreshed (expires in %ds)", self.name, expires_in)
+            return self._agent_token
+
+    @staticmethod
+    def _resolve_agent_target(chat_id: str) -> Dict[str, str]:
+        """解析 chat_id 为 Agent API 的接收目标参数。
+
+        支持的格式：
+        - user:xxx → {"touser": "xxx"}
+        - party:xxx → {"toparty": "xxx"}
+        - tag:xxx → {"totag": "xxx"}
+        - group:xxx / chat:xxx → {"chatid": "xxx"}
+        - 默认 → {"touser": chat_id}
+        """
+        chat_id = chat_id.strip()
+        if chat_id.startswith("party:") or chat_id.startswith("dept:"):
+            return {"toparty": chat_id.split(":", 1)[1].strip()}
+        if chat_id.startswith("tag:"):
+            return {"totag": chat_id.split(":", 1)[1].strip()}
+        if chat_id.startswith("group:") or chat_id.startswith("chat:"):
+            return {"chatid": chat_id.split(":", 1)[1].strip()}
+        if chat_id.startswith("user:"):
+            return {"touser": chat_id.split(":", 1)[1].strip()}
+        # 启发式：以 wr/wc 开头视为群聊
+        if re.match(r"^(wr|wc)", chat_id, re.IGNORECASE):
+            return {"chatid": chat_id}
+        # 默认视为用户ID
+        return {"touser": chat_id}
+
+    async def _send_agent_text(self, chat_id: str, content: str) -> Dict[str, Any]:
+        """通过 Agent HTTP API 发送文本消息。"""
+        token = await self._get_agent_token()
+        target = self._resolve_agent_target(chat_id)
+        is_chat = "chatid" in target
+
+        if is_chat:
+            body = {
+                **target,
+                "msgtype": "text",
+                "text": {"content": content},
+            }
+            url = f"{self._API_SEND_APPCHAT}?access_token={_urlesc(token)}"
+        else:
+            body = {
+                **target,
+                "msgtype": "text",
+                "agentid": self._agent_id,
+                "text": {"content": content},
+            }
+            url = f"{self._API_SEND_MESSAGE}?access_token={_urlesc(token)}"
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=body)
+            data = resp.json()
+
+        errcode = data.get("errcode", -1)
+        if errcode != 0:
+            raise RuntimeError(
+                f"Agent send text failed: errcode={errcode} errmsg={data.get('errmsg', '?')}"
+            )
+        # 检查部分失败
+        invalid = []
+        for key in ("invaliduser", "invalidparty", "invalidtag"):
+            val = data.get(key)
+            if val:
+                invalid.append(f"{key}={val}")
+        if invalid:
+            logger.warning(
+                "[%s] Agent send partial failure: %s", self.name, ", ".join(invalid)
+            )
+        logger.info("[%s] Agent text sent via HTTP API to %s", self.name, chat_id)
+        return data
+
+    async def _upload_agent_media(
+        self, data: bytes, media_type: str, filename: str,
+    ) -> str:
+        """通过 Agent HTTP API 上传临时素材，返回 media_id。"""
+        token = await self._get_agent_token()
+        url = f"{self._API_UPLOAD_MEDIA}?access_token={_urlesc(token)}&type={_urlesc(media_type)}"
+        mime_map = {
+            "image": "image/png",
+            "voice": "audio/amr",
+            "video": "video/mp4",
+            "file": "application/octet-stream",
+        }
+        content_type = mime_map.get(media_type, "application/octet-stream")
+
+        # 用 httpx 的 multipart 上传
+        files = {"media": (filename, data, content_type)}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, files=files)
+            result = resp.json()
+
+        if not result.get("media_id"):
+            raise RuntimeError(
+                f"Agent upload failed: errcode={result.get('errcode')} "
+                f"errmsg={result.get('errmsg', '?')}"
+            )
+        logger.info(
+            "[%s] Agent media uploaded: type=%s filename=%s media_id=%s",
+            self.name, media_type, filename, result["media_id"][:16],
+        )
+        return result["media_id"]
+
+    async def _send_agent_media(
+        self, chat_id: str, media_type: str, media_id: str,
+    ) -> Dict[str, Any]:
+        """通过 Agent HTTP API 发送已上传的媒体消息。"""
+        token = await self._get_agent_token()
+        target = self._resolve_agent_target(chat_id)
+        is_chat = "chatid" in target
+
+        media_payload = {"media_id": media_id}
+        if is_chat:
+            body = {
+                **target,
+                "msgtype": media_type,
+                media_type: media_payload,
+            }
+            url = f"{self._API_SEND_APPCHAT}?access_token={_urlesc(token)}"
+        else:
+            body = {
+                **target,
+                "msgtype": media_type,
+                "agentid": self._agent_id,
+                media_type: media_payload,
+            }
+            url = f"{self._API_SEND_MESSAGE}?access_token={_urlesc(token)}"
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=body)
+            data = resp.json()
+
+        errcode = data.get("errcode", -1)
+        if errcode != 0:
+            raise RuntimeError(
+                f"Agent send {media_type} failed: errcode={errcode} errmsg={data.get('errmsg', '?')}"
+            )
+        logger.info("[%s] Agent %s sent via HTTP to %s", self.name, media_type, chat_id)
+        return data
+
+    async def _agent_markdown_unsupported(self, chat_id: str, content: str) -> Dict[str, Any]:
+        """Agent API 不支持 markdown（仅支持 text），转成纯文本发送。"""
+        # 去除 markdown 格式字符，保留核心内容
+        plain = re.sub(r"[*_~`#>]", "", content)
+        plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
+        return await self._send_agent_text(chat_id, plain[:self.MAX_MESSAGE_LENGTH])
+
+    # ------------------------------------------------------------------
+    # MCP (Model Context Protocol) — 企业微信内置工具集成
+    # ------------------------------------------------------------------
+
+    _MCP_GET_CONFIG_CMD = "aibot_get_mcp_config"
+    _MCP_PROTOCOL_VERSION = "2025-03-26"
+    _MCP_CLIENT_NAME = "hermes_wecom_mcp"
+    _MCP_CLIENT_VERSION = "1.0.0"
+    _MCP_REQUEST_TIMEOUT = 30.0
+    _MCP_INIT_TIMEOUT = 15.0
+
+    @staticmethod
+    def _mcp_cache_key(account_id: str, category: str) -> str:
+        return f"{account_id}:{category}"
+
+    async def _fetch_mcp_config(self, category: str) -> Dict[str, Any]:
+        """通过 WS 拉取指定品类的 MCP 配置（Server URL）。"""
+        if not self._ws or self._ws.closed:
+            raise RuntimeError("WebSocket not connected, cannot fetch MCP config")
+        req_id = self._new_req_id("mcp_config")
+        future = asyncio.get_running_loop().create_future()
+        self._pending_responses[req_id] = future
+        try:
+            await self._send_json({
+                "cmd": self._MCP_GET_CONFIG_CMD,
+                "headers": {"req_id": req_id},
+                "body": {
+                    "biz_type": category,
+                    "plugin_version": "1.0.0",
+                },
+            })
+            response = await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT_SECONDS)
+            errcode = response.get("errcode", -1)
+            if errcode not in (0, None):
+                raise RuntimeError(
+                    f"MCP config fetch failed: errcode={errcode} errmsg={response.get('errmsg', '?')}"
+                )
+            body = response.get("body") if isinstance(response.get("body"), dict) else {}
+            url = str(body.get("url") or "").strip()
+            if not url:
+                raise RuntimeError(f"MCP config response missing url field (category={category})")
+            logger.info(
+                "[%s] MCP config fetched: category=%s url=%s",
+                self.name, category, url,
+            )
+            return body
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"MCP config fetch timed out for category={category}")
+        finally:
+            self._pending_responses.pop(req_id, None)
+
+    async def _mcp_http_request(
+        self,
+        url: str,
+        rpc_body: Dict[str, Any],
+        session_id: Optional[str] = None,
+        timeout: float = _MCP_REQUEST_TIMEOUT,
+        requester_user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """发送 JSON-RPC 请求到 MCP Server（Streamable HTTP）。"""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "User-Agent": "HermesWeCom/1.0",
+        }
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+        if requester_user_id:
+            headers["x-openclaw-wecom-userid"] = requester_user_id
+
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.post(url, json=rpc_body, headers=headers)
+
+        # 提取新的 session ID
+        new_session_id = resp.headers.get("mcp-session-id")
+
+        if resp.status_code == 204:
+            return {"result": None, "new_session_id": new_session_id}
+
+        content_type = (resp.headers.get("content-type") or "").lower()
+
+        # SSE 响应
+        if "text/event-stream" in content_type:
+            text = resp.text
+            result = self._parse_mcp_sse(text)
+            return {"result": result, "new_session_id": new_session_id}
+
+        # 普通 JSON 响应
+        text = resp.text.strip()
+        if not text:
+            return {"result": None, "new_session_id": new_session_id}
+
+        try:
+            rpc = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            raise RuntimeError(f"MCP non-JSON response (HTTP {resp.status_code})")
+
+        if not isinstance(rpc, dict):
+            raise RuntimeError(f"MCP unexpected response type: {type(rpc).__name__}")
+
+        if "error" in rpc:
+            err = rpc["error"]
+            code = err.get("code", -1)
+            msg = err.get("message", "unknown error")
+            raise RuntimeError(f"MCP RPC error [{code}]: {msg}")
+
+        return {"result": rpc.get("result"), "new_session_id": new_session_id}
+
+    @staticmethod
+    def _parse_mcp_sse(text: str) -> Optional[Any]:
+        """解析 SSE 流式响应，取最后一个事件的数据。"""
+        lines = text.split("\n")
+        current_parts: List[str] = []
+        last_data = ""
+        for line in lines:
+            if line.startswith("data: "):
+                current_parts.append(line[6:])
+            elif line.startswith("data:"):
+                current_parts.append(line[5:])
+            elif line.strip() == "" and current_parts:
+                last_data = "\n".join(current_parts).strip()
+                current_parts = []
+        if current_parts:
+            last_data = "\n".join(current_parts).strip()
+        if not last_data:
+            raise RuntimeError("SSE response contains no valid data")
+        rpc = json.loads(last_data)
+        if isinstance(rpc, dict) and "error" in rpc:
+            err = rpc["error"]
+            raise RuntimeError(f"MCP SSE RPC error [{err.get('code')}]: {err.get('message')}")
+        if isinstance(rpc, dict):
+            return rpc.get("result")
+        return rpc
+
+    async def _mcp_initialize(
+        self,
+        url: str,
+        account_id: str,
+        category: str,
+        requester_user_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """执行 Streamable HTTP initialize 握手，返回 session_id（无状态则返回 None）。"""
+        init_body = {
+            "jsonrpc": "2.0",
+            "id": self._new_req_id("mcp_init"),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": self._MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": self._MCP_CLIENT_NAME,
+                    "version": self._MCP_CLIENT_VERSION,
+                },
+            },
+        }
+        result = await self._mcp_http_request(
+            url, init_body, timeout=self._MCP_INIT_TIMEOUT,
+            requester_user_id=requester_user_id,
+        )
+        session_id = result.get("new_session_id")
+
+        # 发送 initialized 通知（无状态 server 没有 session_id 也要发）
+        notify_body = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }
+        await self._mcp_http_request(
+            url, notify_body, session_id=session_id,
+            timeout=self._MCP_INIT_TIMEOUT,
+            requester_user_id=requester_user_id,
+        )
+
+        logger.info(
+            "[%s] MCP initialized: category=%s session_id=%s",
+            self.name, category, session_id or "(stateless)",
+        )
+        return session_id
+
+    _mcp_config_cache: Dict[str, Dict[str, Any]] = {}
+    _mcp_session_cache: Dict[str, Optional[str]] = {}  # category → session_id or None
+    _mcp_init_locks: Dict[str, asyncio.Lock] = {}
+
+    async def _ensure_mcp_session(
+        self,
+        category: str,
+        requester_user_id: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """获取 MCP Server URL 和有效 session。自动初始化/复用会话。"""
+        account_id = self._bot_id  # 用 bot_id 作为账户标识
+        key = self._mcp_cache_key(account_id, category)
+
+        # 1. 获取/缓存配置（URL）
+        if key not in self._mcp_config_cache:
+            config = await self._fetch_mcp_config(category)
+            self._mcp_config_cache[key] = config
+        url = str(self._mcp_config_cache[key].get("url") or "").strip()
+
+        # 2. 获取/初始化会话
+        existing_session = self._mcp_session_cache.get(key)
+        if existing_session is not None:
+            return url, existing_session or None  # None = 无状态
+
+        if key not in self._mcp_init_locks:
+            self._mcp_init_locks[key] = asyncio.Lock()
+        async with self._mcp_init_locks[key]:
+            if key in self._mcp_session_cache:
+                return url, self._mcp_session_cache[key] or None
+            session_id = await self._mcp_initialize(url, account_id, category, requester_user_id)
+            self._mcp_session_cache[key] = session_id or ""  # "" = 无状态
+            return url, session_id
+
+    async def send_mcp_list(
+        self,
+        category: str,
+        requester_user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """列出指定品类的所有 MCP 工具。"""
+        url, session_id = await self._ensure_mcp_session(category, requester_user_id)
+        rpc_body = {
+            "jsonrpc": "2.0",
+            "id": self._new_req_id("mcp_list"),
+            "method": "tools/list",
+        }
+        result = await self._mcp_http_request(url, rpc_body, session_id, requester_user_id=requester_user_id)
+        return result.get("result") or {}
+
+    async def send_mcp_call(
+        self,
+        category: str,
+        method: str,
+        args: Dict[str, Any],
+        requester_user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """调用指定品类的某个 MCP 工具。"""
+        url, session_id = await self._ensure_mcp_session(category, requester_user_id)
+        rpc_body = {
+            "jsonrpc": "2.0",
+            "id": self._new_req_id("mcp_call"),
+            "method": "tools/call",
+            "params": {
+                "name": method,
+                "arguments": args or {},
+            },
+        }
+        result = await self._mcp_http_request(url, rpc_body, session_id, requester_user_id=requester_user_id)
+        return result.get("result") or {}
+
     async def _send_reply_markdown(self, reply_req_id: str, content: str) -> Dict[str, Any]:
         response = await self._send_reply_request(
             reply_req_id,
@@ -1528,29 +2216,52 @@ class WeComAdapter(BasePlatformAdapter):
         if not reply_req_id and chat_id in self._last_chat_req_ids:
             reply_req_id = self._last_chat_req_ids[chat_id]
 
-        try:
-            upload_result = await self._upload_media_bytes(
-                prepared["data"],
-                prepared["final_type"],
-                prepared["file_name"],
+        ws_available = self._ws is not None and not self._ws.closed
+        if not ws_available and self._agent_configured:
+            # WS 不可用，通过 Agent HTTP API 上传和发送媒体
+            logger.warning(
+                "[%s] WebSocket not available, sending media via Agent HTTP API to %s",
+                self.name, chat_id,
             )
-            if reply_req_id:
-                media_response = await self._send_reply_media_message(
-                    reply_req_id,
+            try:
+                media_id = await self._upload_agent_media(
+                    prepared["data"],
                     prepared["final_type"],
-                    upload_result["media_id"],
+                    prepared["file_name"],
                 )
-            else:
-                media_response = await self._send_media_message(
+                await self._send_agent_media(
                     chat_id,
                     prepared["final_type"],
-                    upload_result["media_id"],
+                    media_id,
                 )
-        except asyncio.TimeoutError:
-            return SendResult(success=False, error="Timeout sending media to WeCom")
-        except Exception as exc:
-            logger.error("[%s] Failed to send media %s: %s", self.name, media_source, exc)
-            return SendResult(success=False, error=str(exc))
+                media_response = {"errcode": 0, "media_id": media_id}
+            except Exception as exc:
+                logger.error("[%s] Agent media send failed: %s", self.name, exc)
+                return SendResult(success=False, error=str(exc))
+        else:
+            try:
+                upload_result = await self._upload_media_bytes(
+                    prepared["data"],
+                    prepared["final_type"],
+                    prepared["file_name"],
+                )
+                if reply_req_id:
+                    media_response = await self._send_reply_media_message(
+                        reply_req_id,
+                        prepared["final_type"],
+                        upload_result["media_id"],
+                    )
+                else:
+                    media_response = await self._send_media_message(
+                        chat_id,
+                        prepared["final_type"],
+                        upload_result["media_id"],
+                    )
+            except asyncio.TimeoutError:
+                return SendResult(success=False, error="Timeout sending media to WeCom")
+            except Exception as exc:
+                logger.error("[%s] Failed to send media %s: %s", self.name, media_source, exc)
+                return SendResult(success=False, error=str(exc))
 
         caption_result = None
         downgrade_result = None
@@ -1624,6 +2335,27 @@ class WeComAdapter(BasePlatformAdapter):
             self.name, chat_id, streaming, reply_to, len(content),
         )
 
+        # 检查 WebSocket 是否可用；不可用时回退到 Agent HTTP API
+        ws_available = self._ws is not None and not self._ws.closed
+        if not ws_available and self._agent_configured and not reply_to:
+            logger.warning(
+                "[%s] WebSocket not available, falling back to Agent HTTP API for send to %s",
+                self.name, chat_id,
+            )
+            try:
+                remaining = await self._detect_and_send_template_cards(content, chat_id)
+                if not remaining:
+                    remaining = " "
+                response_data = await self._agent_markdown_unsupported(chat_id, remaining)
+                return SendResult(
+                    success=True,
+                    message_id=f"agent-{uuid.uuid4().hex[:12]}",
+                    raw_response=response_data,
+                )
+            except Exception as exc:
+                logger.error("[%s] Agent fallback send failed: %s", self.name, exc)
+                return SendResult(success=False, error=str(exc))
+
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
@@ -1685,16 +2417,28 @@ class WeComAdapter(BasePlatformAdapter):
                         finish=False,
                     )
                 else:
-                    response = await self._send_reply_markdown(reply_req_id, content)
+                    # 检测并发送模板卡片（非流式回复路径）
+                    remaining = await self._detect_and_send_template_cards(
+                        content, chat_id, reply_req_id=reply_req_id,
+                    )
+                    if remaining:
+                        response = await self._send_reply_markdown(reply_req_id, remaining)
+                    else:
+                        response = {"headers": {"req_id": reply_req_id}, "errcode": 0}
             else:
-                response = await self._send_request(
-                    APP_CMD_SEND,
-                    {
-                        "chatid": chat_id,
-                        "msgtype": "markdown",
-                        "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
-                    },
-                )
+                # 检测并发送模板卡片（非流式主动发送路径）
+                remaining = await self._detect_and_send_template_cards(content, chat_id)
+                if remaining:
+                    response = await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": chat_id,
+                            "msgtype": "markdown",
+                            "markdown": {"content": remaining[:self.MAX_MESSAGE_LENGTH]},
+                        },
+                    )
+                else:
+                    response = {"headers": {"req_id": self._new_req_id("tc")}, "errcode": 0}
         except asyncio.TimeoutError:
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
@@ -1781,15 +2525,20 @@ class WeComAdapter(BasePlatformAdapter):
                 self.name, chat_id,
             )
             try:
-                response = await self._send_request(
-                    APP_CMD_SEND,
-                    {
-                        "chatid": chat_id,
-                        "msgtype": "markdown",
-                        "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
-                    },
-                )
-                self._raise_for_wecom_error(response, "finalize_stream proactive send")
+                # 先检测并发送模板卡片
+                remaining = await self._detect_and_send_template_cards(content, chat_id)
+                if remaining:
+                    response = await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": chat_id,
+                            "msgtype": "markdown",
+                            "markdown": {"content": remaining[:self.MAX_MESSAGE_LENGTH]},
+                        },
+                    )
+                    self._raise_for_wecom_error(response, "finalize_stream proactive send")
+                else:
+                    response = {"headers": {"req_id": uuid.uuid4().hex[:12]}, "errcode": 0}
                 return SendResult(
                     success=True,
                     message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
@@ -1827,9 +2576,44 @@ class WeComAdapter(BasePlatformAdapter):
         # finalize ACK.
         await asyncio.sleep(0.25)
         try:
-            response = await self._send_reply_stream(
-                reply_req_id, content, stream_id=stream_id, finish=True,
+            # 先关闭 stream bubble（finish=True 发空内容），然后以 markdown 格式主动发送
+            # 最终内容，确保可长按转发和表格左右滑动。stream 消息在 WeCom 客户端上
+            # 不支持转发和表格滚动，而 markdown 消息（aibot_send_msg）支持。
+            remaining = await self._detect_and_send_template_cards(
+                content, chat_id, reply_req_id=reply_req_id,
             )
+            if not remaining:
+                remaining = " "
+            # Step 1: 关闭 stream bubble（空内容 finish=True）
+            try:
+                await self._send_reply_stream(
+                    reply_req_id, " ", stream_id=stream_id, finish=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] finalize_stream: close stream bubble failed (non-fatal): %s",
+                    self.name, exc,
+                )
+            # Step 2: 以 markdown 格式发送实际内容（可转发、可滚动表格）
+            markdown_result = await self._send_request(
+                APP_CMD_SEND,
+                {
+                    "chatid": chat_id,
+                    "msgtype": "markdown",
+                    "markdown": {"content": remaining[:self.MAX_MESSAGE_LENGTH]},
+                },
+            )
+            errcode = markdown_result.get("errcode", 0)
+            if errcode != 0:
+                # Proactive send failed (e.g. group chat restriction) —
+                # fall back to reply-mode markdown
+                logger.warning(
+                    "[%s] finalize_stream: proactive send failed (errcode=%d), "
+                    "falling back to reply-mode markdown",
+                    self.name, errcode,
+                )
+                markdown_result = await self._send_reply_markdown(reply_req_id, remaining)
+            response = markdown_result
             # Notify any waiters on the ack event for this reply_req_id.
             ack_event = self._stream_ack_events.get(reply_req_id)
             if ack_event:
