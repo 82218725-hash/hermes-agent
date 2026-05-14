@@ -515,7 +515,7 @@ class WeComAdapter(BasePlatformAdapter):
                 evt_req_id = self._payload_req_id(payload)
                 if evt_req_id:
                     self._remember_chat_req_id(chat_id, evt_req_id)
-                    self._event_callback_chats.add(chat_id)
+                    # self._event_callback_chats.add(chat_id)  # disabled: causes reply to skip reply-stream, which breaks forwarding and table swipe on WeCom
             # 检查是否包含模板卡片事件回调（按钮点击、提交等）—
             # 需要路由给 _on_message 处理
             body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
