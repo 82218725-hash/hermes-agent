@@ -2410,13 +2410,7 @@ class WeComAdapter(BasePlatformAdapter):
                             stream_id=stream_id, finish=False,
                         )
                         self._active_streams[chat_id] = (reply_req_id, stream_id)
-                    response = await self._send_reply_stream_non_blocking(
-                        reply_req_id,
-                        content,
-                        stream_id=stream_id,
-                        finish=False,
-                    )
-                else:
+                    response = await self._send_reply_markdown(reply_req_id, content[:10240])
                     # 检测并发送模板卡片（非流式回复路径）
                     remaining = await self._detect_and_send_template_cards(
                         content, chat_id, reply_req_id=reply_req_id,
